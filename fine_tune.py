@@ -193,6 +193,10 @@ def parse_args():
         "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
     )
 
+    parser.add_argument(
+        "--model_checkpoint_n_steps", type=int, default=8, help="Number of steps between each full model save."
+    )
+
     parser.add_argument("--num_train_epochs", type=int, default=1)
 
     parser.add_argument(
@@ -281,7 +285,7 @@ def parse_args():
         "--save_n_steps",
         type=int,
         default=100,
-        help="Save the model every n global_steps",
+        help="Save the model weights in .pth format every n steps.",
     )
 
     parser.add_argument(
@@ -336,6 +340,7 @@ def main():
     args = parse_args()
 
     next_save_iter = args.save_starting_step
+    next_model_save = args.save_starting_step
 
     if args.save_starting_step < 1:
         next_save_iter = None
@@ -708,15 +713,16 @@ def main():
             w, h = aspect_ratio_map[args.aspect_ratio]
 
             for prompt in prompts:
-                video = pipe(prompt,
-                             width=w,
-                             height=h,
-                             original_size=(1920, 1080),  # todo - pass in as args?
-                             target_size=(args.resolution, args.resolution),
-                             num_inference_steps=30,
-                             video_length=8,
-                             output_type="tensor",
-                             generator=torch.Generator().manual_seed(111)).videos
+                with torch.cuda.amp.autocast():
+                    video = pipe(prompt,
+                                width=w,
+                                height=h,
+                                original_size=(1920, 1080),  # todo - pass in as args?
+                                target_size=(args.resolution, args.resolution),
+                                num_inference_steps=30,
+                                video_length=8,
+                                output_type="tensor",
+                                generator=torch.Generator().manual_seed(111)).videos
 
                 videos.append(to_images(video))
 
@@ -774,13 +780,57 @@ def main():
 
     latents_scaler = vae.config.scaling_factor
 
+    def export_pth():
+        """
+        Saves only the motion-specific layers from the current state of the model.
+
+        Args:
+            global_step (int): The current training step to append to the filename.
+            model: The model object containing the state_dict.
+            output_dir (str): The directory to save the .pth file.
+        """
+        # Extract the model's current state dictionary
+        model = accelerator.unwrap_model(unet)
+        model_state = model.state_dict()
+
+        # Filter out only motion-specific layers
+        motion_layers = {key: value for key, value in model_state.items() if "temporal" in key.lower()}
+        if not motion_layers:
+            raise ValueError("No motion-specific layers found in the model state.")
+
+        # Create the directory for saving the .pth files
+        output_pth_dir = Path(args.output_dir) / "pth_exports"
+        output_pth_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save the motion layers as a .pth file with the step count appended
+        output_model_path = output_pth_dir / f"motion_model_step_{global_step}.pth"
+        torch.save(motion_layers, output_model_path)
+        print(f"Exported motion-specific .pth file to: {output_model_path}")
+
     def save_checkpoint():
-        save_dir = Path(args.output_dir)
-        save_dir = str(save_dir)
-        save_dir = save_dir.replace(" ", "_")
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir, exist_ok=True)
-        accelerator.save_state(save_dir)
+        nonlocal global_step
+        nonlocal next_model_save
+
+        # Create the save directory with step number appended
+        save_dir = Path(args.output_dir) /f"steps/step_{global_step}"
+        save_dir = str(save_dir).replace(" ", "_")
+
+        # Ensure the directory exists
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save the state
+        #accelerator.save_state(save_dir)
+
+        # Export the .pth file
+        export_pth()
+
+        # This function gets called in relation with next_save_iter to save the .pth export
+        # So we check to see if we should make a dump of the full model as well
+        if next_model_save is not None \
+                and global_step < args.max_train_steps \
+                and global_step > next_model_save:
+            accelerator.save_state(save_dir)
+            next_model_save += args.model_checkpoint_n_steps
 
     def save_checkpoint_and_wait():
         if accelerator.is_main_process:
@@ -788,6 +838,7 @@ def main():
         accelerator.wait_for_everyone()
 
     def save_model_and_wait():
+        print("saving model...")
         if accelerator.is_main_process:
             HotshotXLPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
@@ -796,6 +847,7 @@ def main():
                 text_encoder_2=text_encoder_2,
                 vae=vae,
             ).save_pretrained(args.output_dir, safe_serialization=True)
+        print('model saved')
         accelerator.wait_for_everyone()
 
     def compute_loss_from_batch(batch: dict):
@@ -874,13 +926,14 @@ def main():
 
         noisy_latents.requires_grad = True
 
-        model_pred = unet(noisy_latents,
-                          timesteps,
-                          cross_attention_kwargs=None,
-                          encoder_hidden_states=prompt_embeds,
-                          added_cond_kwargs=added_cond_kwargs,
-                          return_dict=False,
-                          )[0]
+        with torch.cuda.amp.autocast():
+            model_pred = unet(noisy_latents,
+                            timesteps,
+                            cross_attention_kwargs=None,
+                            encoder_hidden_states=prompt_embeds,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                            )[0]
 
         if args.snr_gamma:
             # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.

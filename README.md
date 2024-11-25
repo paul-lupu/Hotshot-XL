@@ -208,27 +208,39 @@ fine_tune_dataset
 Each sample directory should contain your **n key frames** and a `prompt.txt` file which contains the prompt.
 The final checkpoint will be saved to `output_dir`.
 We've found it useful to send validation GIFs to [Weights & Biases](www.wandb.ai) every so often. If you choose to use validation with Weights & Biases, you can set how often this runs with the `validate_every_steps` parameter.
+At each checkpoint the script will save the model into outputs/steps and the motion model into outputs/pth_exports
+
+To run on low vram (rtx4090) i used the following settings:
+* run `accelerate config` and enable `deepspeed` -> enable CPU offloading for both options
+* use maximum 8 images; the way I did it was using 8 images in two sample directories
+* use a very low training speed over multiple steps (5e-6 or lower)
+
+You can edit `run-fine-tune.sh` to point it to your dataset and run it with the following settings: 
 
 ```
-accelerate launch fine_tune.py \
-    --output_dir="<OUTPUT_DIR>" \
-    --data_dir="fine_tune_dataset" \
-    --report_to="wandb" \
-    --run_validation_at_start \
-    --resolution=512 \
-    --mixed_precision=fp16 \
+
+    --max_train_steps=3000 \
+    --save_n_steps=50 \
+    --model_checkpoint_n_steps=500 \
+    --save_starting_step=1500 \
     --train_batch_size=4 \
-    --learning_rate=1.25e-05 \
-    --lr_scheduler="constant" \
-    --lr_warmup_steps=0 \
-    --max_train_steps=1000 \
-    --save_n_steps=20 \
-    --validate_every_steps=50 \
+    --lr_warmup_steps=150 \
+    --learning_rate=1e-6 \
+    --output_dir="outputs" \
+    --data_dir="datasets/" \
+    --latent_nan_checking \
+    --aspect_ratio=1.00 \
+    --mixed_precision=bf16  \
+    --lr_scheduler="constant_with_warmup" \
+    --use_8bit_adam \
     --vae_b16 \
+    --validate_every_steps=2000 \
     --gradient_checkpointing \
     --noise_offset=0.05 \
     --snr_gamma \
     --test_prompts="man sits at a table in a cafe, he greets another man with a smile and a handshakes"
+
+
 ```
 
 # 📝 Further work
